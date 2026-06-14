@@ -397,13 +397,12 @@ function parseSequenceSpecification(description) {
     .replace(/[０１]/g, (digit) => digit === "０" ? "0" : "1");
   const model = /\bmoore\b|摩爾/.test(normalized) ? "moore" : "mealy";
   const overlap = !/\bnon[-\s]?overlap|overlapping\s+is\s+not\s+allowed|without\s+overlap|不允許重疊|不可重疊|禁止重疊/.test(normalized);
-  const requestedStateMatch = normalized.match(/(?:\(|\b)([2-8])\s*(?:states?|個?\s*狀態)/);
-  const requestedStateCount = requestedStateMatch ? Number(requestedStateMatch[1]) : null;
+  const requestedStateCount = extractRequestedStateCount(normalized);
   const segments = extractQuantifiedSegments(normalized);
   const patterns = extractBinaryPatterns(normalized);
 
   if (segments.length === 0 && patterns.length === 0) {
-    throw new Error("無法辨識序列規則。請包含 0/1、數量條件，以及 followed by／接著等順序描述。");
+    throw new Error("無法辨識序列規則。可輸入 010、0 1 0、連續數量條件，或 followed by／接著等描述。");
   }
 
   return {
@@ -413,6 +412,17 @@ function parseSequenceSpecification(description) {
     patterns,
     requestedStateCount,
   };
+}
+
+function extractRequestedStateCount(text) {
+  const numberToken = "(one|two|three|four|five|six|seven|eight|[2-8]|一|二|三|四|五|六|七|八)";
+  const additionalMatch = text.match(new RegExp(`${numberToken}\\s+(?:additional|more)\\s+states?`));
+  if (additionalMatch) {
+    return parseNumberWord(additionalMatch[1]) + 1;
+  }
+
+  const directMatch = text.match(new RegExp(`(?:\\(|\\b)${numberToken}\\s*(?:states?|個?\\s*狀態)`));
+  return directMatch ? parseNumberWord(directMatch[1]) : null;
 }
 
 function extractQuantifiedSegments(text) {
@@ -494,6 +504,15 @@ function extractBinaryPatterns(text) {
     }
   };
 
+  for (const match of text.matchAll(/\b[01](?:\s+[01]){1,7}\b/g)) {
+    addPattern(match[0].replace(/\s+/g, ""));
+  }
+
+  for (const match of text.matchAll(/(?:either\s+)?([01]{2,8})\s+(?:or|and)\s+([01]{2,8})/g)) {
+    addPattern(match[1]);
+    addPattern(match[2]);
+  }
+
   const consecutiveEnglish = /(?:exactly\s+)?(one|two|three|four|five|six|seven|eight|\d+)\s+consecutive\s+([01])(?:'s|s)?/g;
   for (const match of text.matchAll(consecutiveEnglish)) {
     const count = parseNumberWord(match[1]);
@@ -563,12 +582,18 @@ function buildSequenceMachine(specification) {
 
   const baseStates = new Set([""]);
   specification.patterns.forEach((pattern) => {
-    for (let length = 1; length <= pattern.length; length += 1) {
+    const finalPrefixLength = specification.model === "mealy"
+      ? pattern.length - 1
+      : pattern.length;
+    for (let length = 1; length <= finalPrefixLength; length += 1) {
       baseStates.add(pattern.slice(0, length));
     }
   });
 
   const requestedCount = specification.requestedStateCount ?? baseStates.size;
+  if (requestedCount < baseStates.size) {
+    throw new Error(`此規則至少需要 ${baseStates.size} 個狀態，無法以 ${requestedCount} states 正確表示。`);
+  }
   const targetCount = Math.max(requestedCount, baseStates.size);
   if (targetCount > 8) {
     throw new Error("目前最多支援 8 個狀態；請縮短序列或指定 8 states 以下。");
