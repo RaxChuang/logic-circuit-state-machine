@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>邏輯電路狀態表與卡諾圖化簡</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="hero-band">
+      <div>
+        <p class="eyebrow">Sequential Logic Lab</p>
+        <h1>邏輯電路狀態表與卡諾圖化簡</h1>
+      </div>
+      <div class="assignment-panel" id="assignmentPanel"></div>
+    </section>
+
+    <section class="specification-panel" aria-labelledby="specificationTitle">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Problem Description</p>
+          <h2 id="specificationTitle">敘述題狀態機生成</h2>
+        </div>
+        <span class="status-pill" id="specStatus">Manual</span>
+      </div>
+      <div class="specification-grid">
+        <label class="specification-input">
+          <span class="control-label">題目敘述</span>
+          <textarea id="specificationText" rows="5" placeholder="A Mealy system whose output is 1 when exactly two consecutive 0s or exactly two consecutive 1s occur. Overlapping is allowed. (6 states)"></textarea>
+        </label>
+        <button class="button generate-button" type="button" id="generateSpecBtn">建立狀態表</button>
+      </div>
+      <div class="specification-message" id="specMessage" aria-live="polite"></div>
+    </section>
+
+    <section class="control-surface" aria-label="電路設定">
+      <div class="control-group">
+        <span class="control-label">模型</span>
+        <div class="segmented" role="radiogroup" aria-label="模型選擇">
+          <button class="segment is-active" type="button" data-model="mealy" aria-pressed="true">Mealy</button>
+          <button class="segment" type="button" data-model="moore" aria-pressed="false">Moore</button>
+        </div>
+      </div>
+
+      <label class="control-group">
+        <span class="control-label">正反器</span>
+        <select id="ffType">
+          <option value="D">D-FF</option>
+          <option value="SR">SR-FF</option>
+          <option value="JK">JK-FF</option>
+          <option value="T">T-FF</option>
+        </select>
+      </label>
+
+      <label class="control-group">
+        <span class="control-label">狀態數</span>
+        <select id="stateCount">
+          <option value="2">2 states</option>
+          <option value="3">3 states</option>
+          <option value="4" selected>4 states</option>
+          <option value="5">5 states</option>
+          <option value="6">6 states</option>
+          <option value="7">7 states</option>
+          <option value="8">8 states</option>
+        </select>
+      </label>
+
+      <div class="action-row">
+        <button class="button secondary" type="button" id="clearBtn">清除</button>
+        <button class="button primary" type="button" id="runBtn">執行化簡</button>
+      </div>
+    </section>
+
+    <section class="workspace-grid">
+      <div class="panel table-panel">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">State Table</p>
+            <h2>互動式狀態表</h2>
+          </div>
+          <span class="status-pill" id="tableStatus"></span>
+        </div>
+        <div id="tableArea"></div>
+      </div>
+
+      <div class="panel result-panel">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">K-map Output</p>
+            <h2>狀態圖、卡諾圖、最簡函數與電路圖</h2>
+          </div>
+        </div>
+        <div id="results" class="empty-results">
+          選擇模型與正反器，填入 next state 與輸出 Z 後按下執行。
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
