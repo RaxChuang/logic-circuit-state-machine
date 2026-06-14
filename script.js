@@ -377,9 +377,11 @@ function generateTableFromDescription() {
     applyGeneratedMachine(machine, specification);
     clearResults();
 
-    const patternText = specification.patterns.join(", ");
+    const patternText = specification.segments
+      ? formatSequenceSegments(specification.segments)
+      : specification.patterns.join(", ");
     specStatus.textContent = "Generated";
-    specMessage.textContent = `${specification.model === "mealy" ? "Mealy" : "Moore"} · patterns ${patternText} · ${machine.states.length} states · ${specification.overlap ? "overlap" : "non-overlap"}`;
+    specMessage.textContent = `${specification.model === "mealy" ? "Mealy" : "Moore"} · rule ${patternText} · ${machine.states.length} states · ${specification.overlap ? "overlap" : "non-overlap"}`;
     specMessage.classList.add("is-success");
   } catch (error) {
     specStatus.textContent = "Manual";
@@ -397,18 +399,91 @@ function parseSequenceSpecification(description) {
   const overlap = !/\bnon[-\s]?overlap|overlapping\s+is\s+not\s+allowed|without\s+overlap|不允許重疊|不可重疊|禁止重疊/.test(normalized);
   const requestedStateMatch = normalized.match(/(?:\(|\b)([2-8])\s*(?:states?|個?\s*狀態)/);
   const requestedStateCount = requestedStateMatch ? Number(requestedStateMatch[1]) : null;
+  const segments = extractQuantifiedSegments(normalized);
   const patterns = extractBinaryPatterns(normalized);
 
-  if (patterns.length === 0) {
-    throw new Error("目前可辨識指定二進位序列，或「連續 N 個 0／1」類型的敘述。");
+  if (segments.length === 0 && patterns.length === 0) {
+    throw new Error("無法辨識序列規則。請包含 0/1、數量條件，以及 followed by／接著等順序描述。");
   }
 
   return {
     model,
     overlap,
+    segments: segments.length > 1 ? segments : null,
     patterns,
     requestedStateCount,
   };
+}
+
+function extractQuantifiedSegments(text) {
+  if (!/\bfollowed\s+by\b|\bthen\b|接著|接續|之後|後面是/.test(text)) {
+    return [];
+  }
+
+  const clauses = text.split(/\s*(?:followed\s+by|then|接著|接續|之後|後面是)\s*/);
+  const segments = clauses.map(parseQuantifiedClause).filter(Boolean);
+  return segments.length > 1 ? mergeAdjacentSegments(segments) : [];
+}
+
+function parseQuantifiedClause(clause) {
+  const number = "(one|two|three|four|five|six|seven|eight|\\d+|a|an)";
+  const english = new RegExp(`(at\\s+least|exactly|at\\s+most)?\\s*${number}\\s*(?:consecutive\\s+)?([01])(?:'s|s)?`, "g");
+  const matches = [...clause.matchAll(english)];
+  if (matches.length > 0) {
+    const match = matches[matches.length - 1];
+    const count = match[2] === "a" || match[2] === "an" ? 1 : parseNumberWord(match[2]);
+    const quantifier = match[1] ?? "exactly";
+    return {
+      bit: match[3],
+      min: quantifier === "at most" ? 1 : count,
+      max: quantifier === "at least" ? Infinity : count,
+    };
+  }
+
+  const oneOrMore = clause.match(/(?:one\s+or\s+more|at\s+least\s+one)\s+(?:consecutive\s+)?([01])(?:'s|s)?/);
+  if (oneOrMore) {
+    return { bit: oneOrMore[1], min: 1, max: Infinity };
+  }
+
+  const chinese = clause.match(/(至少|恰好|正好|最多)?\s*([一二三四五六七八\d]+)\s*個?\s*([01])/);
+  if (chinese) {
+    const count = parseNumberWord(chinese[2]);
+    return {
+      bit: chinese[3],
+      min: chinese[1] === "最多" ? 1 : count,
+      max: chinese[1] === "至少" ? Infinity : count,
+    };
+  }
+
+  return null;
+}
+
+function mergeAdjacentSegments(segments) {
+  return segments.reduce((merged, segment) => {
+    const previous = merged[merged.length - 1];
+    if (!previous || previous.bit !== segment.bit) {
+      merged.push({ ...segment });
+      return merged;
+    }
+
+    previous.min += segment.min;
+    previous.max = previous.max === Infinity || segment.max === Infinity
+      ? Infinity
+      : previous.max + segment.max;
+    return merged;
+  }, []);
+}
+
+function formatSequenceSegments(segments) {
+  return segments.map((segment) => {
+    if (segment.max === Infinity) {
+      return `${segment.bit}{${segment.min},}`;
+    }
+    if (segment.min === segment.max) {
+      return `${segment.bit}{${segment.min}}`;
+    }
+    return `${segment.bit}{${segment.min},${segment.max}}`;
+  }).join(" → ");
 }
 
 function extractBinaryPatterns(text) {
@@ -482,6 +557,10 @@ function parseNumberWord(value) {
 }
 
 function buildSequenceMachine(specification) {
+  if (specification.segments) {
+    return buildQuantifiedSequenceMachine(specification);
+  }
+
   const baseStates = new Set([""]);
   specification.patterns.forEach((pattern) => {
     for (let length = 1; length <= pattern.length; length += 1) {
@@ -530,6 +609,158 @@ function buildSequenceMachine(specification) {
     transitions,
     stateOutputs,
   };
+}
+
+function buildQuantifiedSequenceMachine(specification) {
+  const nfa = compileSequenceSegments(specification.segments);
+  const startSet = epsilonClosure(new Set([nfa.start]), nfa.epsilon);
+  const dfaStates = [];
+  const stateIndexByKey = new Map();
+  const transitions = [];
+  const stateOutputs = [];
+  const queue = [];
+
+  const addState = (stateSet) => {
+    const key = stateSetKey(stateSet);
+    if (stateIndexByKey.has(key)) {
+      return stateIndexByKey.get(key);
+    }
+    const index = dfaStates.length;
+    dfaStates.push(stateSet);
+    stateIndexByKey.set(key, index);
+    queue.push(index);
+    return index;
+  };
+
+  addState(startSet);
+  while (queue.length > 0) {
+    const stateIndex = queue.shift();
+    const stateSet = dfaStates[stateIndex];
+    const isAcceptingState = stateSet.has(nfa.accept);
+    stateOutputs[stateIndex] = isAcceptingState ? "1" : "0";
+    transitions[stateIndex] = ["0", "1"].map((input) => {
+      const activeSet = isAcceptingState && !specification.overlap
+        ? startSet
+        : stateSet;
+      let nextSet = moveNfa(activeSet, input, nfa);
+      nextSet = unionSets(nextSet, startSet);
+      const detected = nextSet.has(nfa.accept);
+      const storedSet = detected && !specification.overlap && specification.model === "mealy"
+        ? startSet
+        : nextSet;
+      return {
+        nextStateIndex: addState(storedSet),
+        output: specification.model === "mealy" && detected ? "1" : "0",
+      };
+    });
+
+    if (dfaStates.length > 8) {
+      throw new Error("這個規則需要超過 8 個狀態，目前網頁最多支援 8 states。");
+    }
+  }
+
+  const requestedCount = specification.requestedStateCount ?? dfaStates.length;
+  if (requestedCount < dfaStates.length) {
+    throw new Error(`此規則至少需要 ${dfaStates.length} 個狀態，無法以 ${requestedCount} states 正確表示。`);
+  }
+  if (requestedCount > 8) {
+    throw new Error("目前最多支援 8 個狀態。");
+  }
+
+  while (dfaStates.length < requestedCount) {
+    dfaStates.push(new Set());
+    transitions.push([
+      { nextStateIndex: 0, output: "X" },
+      { nextStateIndex: 0, output: "X" },
+    ]);
+    stateOutputs.push("X");
+  }
+
+  return {
+    states: dfaStates.map((stateSet) => stateSetKey(stateSet)),
+    transitions,
+    stateOutputs,
+  };
+}
+
+function compileSequenceSegments(segments) {
+  const transitions = new Map();
+  const epsilon = new Map();
+  let current = 0;
+  let nextState = 1;
+
+  const addTransition = (from, input, to) => {
+    const key = `${from}-${input}`;
+    if (!transitions.has(key)) transitions.set(key, new Set());
+    transitions.get(key).add(to);
+  };
+  const addEpsilon = (from, to) => {
+    if (!epsilon.has(from)) epsilon.set(from, new Set());
+    epsilon.get(from).add(to);
+  };
+
+  segments.forEach((segment) => {
+    for (let count = 0; count < segment.min; count += 1) {
+      const target = nextState;
+      nextState += 1;
+      addTransition(current, segment.bit, target);
+      current = target;
+    }
+
+    if (segment.max === Infinity) {
+      addTransition(current, segment.bit, current);
+      const target = nextState;
+      nextState += 1;
+      addEpsilon(current, target);
+      current = target;
+    } else {
+      for (let count = segment.min; count < segment.max; count += 1) {
+        const target = nextState;
+        nextState += 1;
+        addEpsilon(current, target);
+        addTransition(current, segment.bit, target);
+        current = target;
+      }
+    }
+  });
+
+  return {
+    start: 0,
+    accept: current,
+    transitions,
+    epsilon,
+  };
+}
+
+function epsilonClosure(states, epsilon) {
+  const closure = new Set(states);
+  const queue = [...states];
+  while (queue.length > 0) {
+    const state = queue.shift();
+    (epsilon.get(state) ?? []).forEach((target) => {
+      if (!closure.has(target)) {
+        closure.add(target);
+        queue.push(target);
+      }
+    });
+  }
+  return closure;
+}
+
+function moveNfa(states, input, nfa) {
+  const moved = new Set();
+  states.forEach((state) => {
+    (nfa.transitions.get(`${state}-${input}`) ?? []).forEach((target) => moved.add(target));
+  });
+  return epsilonClosure(moved, nfa.epsilon);
+}
+
+function unionSets(first, second) {
+  return new Set([...first, ...second]);
+}
+
+function stateSetKey(stateSet) {
+  return [...stateSet].sort((a, b) => a - b).join(",");
 }
 
 function longestStateSuffix(history, states) {
