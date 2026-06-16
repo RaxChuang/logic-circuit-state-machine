@@ -377,9 +377,7 @@ function generateTableFromDescription() {
     applyGeneratedMachine(machine, specification);
     clearResults();
 
-    const patternText = specification.segments
-      ? formatSequenceSegments(specification.segments)
-      : specification.patterns.join(", ");
+    const patternText = formatSpecificationRule(specification);
     specStatus.textContent = "Generated";
     specMessage.textContent = `${specification.model === "mealy" ? "Mealy" : "Moore"} · rule ${patternText} · ${machine.states.length} states · ${specification.overlap ? "overlap" : "non-overlap"}`;
     specMessage.classList.add("is-success");
@@ -390,28 +388,59 @@ function generateTableFromDescription() {
   }
 }
 
+function formatSpecificationRule(specification) {
+  if (specification.type === "counting") {
+    return specification.countingRule.label;
+  }
+  if (specification.type === "quantified") {
+    return specification.quantifiedAlternatives
+      .map(formatSequenceSegments)
+      .join(" OR ");
+  }
+  return specification.patterns.join(", ");
+}
+
 function parseSequenceSpecification(description) {
-  const normalized = description
-    .toLowerCase()
-    .replace(/[’‘]/g, "'")
-    .replace(/[０１]/g, (digit) => digit === "０" ? "0" : "1");
+  const normalized = normalizeDescription(description);
   const model = /\bmoore\b|摩爾/.test(normalized) ? "moore" : "mealy";
   const overlap = !/\bnon[-\s]?overlap|overlapping\s+is\s+not\s+allowed|without\s+overlap|不允許重疊|不可重疊|禁止重疊/.test(normalized);
   const requestedStateCount = extractRequestedStateCount(normalized);
-  const segments = extractQuantifiedSegments(normalized);
+  const countingRule = extractCountingRule(normalized);
+  const alternatives = splitAlternativeClauses(normalized);
+  const quantifiedAlternatives = alternatives
+    .map(extractQuantifiedSegments)
+    .filter((segments) => segments.length > 1);
   const patterns = extractBinaryPatterns(normalized);
 
-  if (segments.length === 0 && patterns.length === 0) {
-    throw new Error("無法辨識序列規則。可輸入 010、0 1 0、連續數量條件，或 followed by／接著等描述。");
+  if (!countingRule && quantifiedAlternatives.length === 0 && patterns.length === 0) {
+    throw new Error("無法辨識這題的二進位狀態機規則。請把條件寫成固定序列（010、0 1 0、zero one zero）、數量序列（at least/exactly/at most ... followed by ...），或計數題（odd/even/exactly/at least number of 1s/0s）。");
   }
 
   return {
     model,
     overlap,
-    segments: segments.length > 1 ? segments : null,
+    type: countingRule ? "counting" : quantifiedAlternatives.length > 0 ? "quantified" : "patterns",
+    countingRule,
+    quantifiedAlternatives,
+    segments: quantifiedAlternatives.length === 1 ? quantifiedAlternatives[0] : null,
     patterns,
     requestedStateCount,
   };
+}
+
+function normalizeDescription(description) {
+  return description
+    .toLowerCase()
+    .replace(/[’‘]/g, "'")
+    .replace(/[０１]/g, (digit) => digit === "０" ? "0" : "1")
+    .replace(/[，。；：]/g, (mark) => ({ "，": ",", "。": ".", "；": ";", "：": ":" }[mark]))
+    .replace(/\bzeros\b/g, "0s")
+    .replace(/\bones\b/g, "1s")
+    .replace(/\bzeroes\b/g, "0s")
+    .replace(/\bzero\b/g, "0")
+    .replace(/\bone\b/g, "one")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function extractRequestedStateCount(text) {
@@ -423,6 +452,30 @@ function extractRequestedStateCount(text) {
 
   const directMatch = text.match(new RegExp(`(?:\\(|\\b)${numberToken}\\s*(?:states?|個?\\s*狀態)`));
   return directMatch ? parseNumberWord(directMatch[1]) : null;
+}
+
+function splitAlternativeClauses(text) {
+  let ruleText = text
+    .replace(/\([^)]*states?[^)]*\)/g, " ")
+    .replace(/\bwhen\s+first\s+turned\s+on\b.*$/g, " ")
+    .replace(/\boverlapping?\b.*$/g, " ");
+
+  const iffMatch = ruleText.match(/\b(?:iff|if\s+and\s+only\s+if)\b(.+)/);
+  if (iffMatch) {
+    ruleText = iffMatch[1];
+  } else {
+    const outputWhenMatch = ruleText.match(/\boutput\b.*?\b(?:when|whenever|after)\b(.+)/);
+    if (outputWhenMatch) {
+      ruleText = outputWhenMatch[1];
+    }
+  }
+
+  const eitherMatch = ruleText.match(/\beither\b(.+)/);
+  const source = eitherMatch ? eitherMatch[1] : ruleText;
+  return source
+    .split(/\s+(?:or|或)\s+/)
+    .map((clause) => clause.replace(/^[,.;:\s]+|[,.;:\s]+$/g, "").trim())
+    .filter(Boolean);
 }
 
 function extractQuantifiedSegments(text) {
@@ -437,12 +490,12 @@ function extractQuantifiedSegments(text) {
 
 function parseQuantifiedClause(clause) {
   const number = "(one|two|three|four|five|six|seven|eight|\\d+|a|an)";
-  const english = new RegExp(`(at\\s+least|exactly|at\\s+most)?\\s*${number}\\s*(?:consecutive\\s+)?([01])(?:'s|s)?`, "g");
+  const english = new RegExp(`(at\\s+least|not\\s+less\\s+than|minimum\\s+of|exactly|at\\s+most|no\\s+more\\s+than)?\\s*${number}\\s*(?:consecutive\\s+)?([01])(?:'s|s)?`, "g");
   const matches = [...clause.matchAll(english)];
   if (matches.length > 0) {
     const match = matches[matches.length - 1];
     const count = match[2] === "a" || match[2] === "an" ? 1 : parseNumberWord(match[2]);
-    const quantifier = match[1] ?? "exactly";
+    const quantifier = canonicalQuantifier(match[1] ?? "exactly");
     return {
       bit: match[3],
       min: quantifier === "at most" ? 1 : count,
@@ -504,8 +557,20 @@ function extractBinaryPatterns(text) {
     }
   };
 
-  for (const match of text.matchAll(/\b[01](?:\s+[01]){1,7}\b/g)) {
-    addPattern(match[0].replace(/\s+/g, ""));
+  for (const quoted of text.matchAll(/["'“”]([^"'“”]+)["'“”]/g)) {
+    addPattern(parseBinaryPhrase(quoted[1]));
+  }
+
+  splitAlternativeClauses(text).forEach((clause) => {
+    addPattern(parseBinaryPhrase(clause));
+  });
+
+  for (const match of text.matchAll(/\b[01](?:[\s,\-/→]+[01]){1,7}\b/g)) {
+    addPattern(match[0].replace(/[^01]/g, ""));
+  }
+
+  for (const match of text.matchAll(/\b(?:0|1|zero|one)(?:[\s,\-/→]+(?:0|1|zero|one)){1,7}\b/g)) {
+    addPattern(parseBinaryPhrase(match[0]));
   }
 
   for (const match of text.matchAll(/(?:either\s+)?([01]{2,8})\s+(?:or|and)\s+([01]{2,8})/g)) {
@@ -553,8 +618,99 @@ function extractBinaryPatterns(text) {
   return patterns;
 }
 
+function parseBinaryPhrase(phrase) {
+  if (!phrase) {
+    return "";
+  }
+
+  const compactMatch = phrase.match(/\b[01]{2,8}\b/);
+  if (compactMatch) {
+    return compactMatch[0];
+  }
+
+  const adjacentRun = phrase.match(/\b(?:0|1|zero|one)(?:[\s,\-/→]+(?:0|1|zero|one)){1,7}\b/);
+  if (adjacentRun) {
+    return [...adjacentRun[0].matchAll(/\b(0|1|zero|one)\b/g)].map((match) => {
+      if (match[1] === "zero") return "0";
+      if (match[1] === "one") return "1";
+      return match[1];
+    }).join("");
+  }
+
+  const tokens = [...phrase.matchAll(/\b(0|1|zero|one)\b/g)].map((match) => {
+    if (match[1] === "zero") return "0";
+    if (match[1] === "one") return "1";
+    return match[1];
+  });
+  return tokens.length >= 2 && tokens.length <= 8 && /^[\s,\-/→01zeroone]+$/.test(phrase)
+    ? tokens.join("")
+    : "";
+}
+
+function extractCountingRule(text) {
+  if (/\bconsecutive\b|\bfollowed\s+by\b|\bthen\b|接著|接續|之後|後面是/.test(text)) {
+    return null;
+  }
+
+  const bitMatch = text.match(/\b(?:number|count)\s+of\s+([01])(?:'s|s)?\b|\b([01])(?:'s|s)?\s+(?:count|number)\b|([01])\s*的?數量/);
+  const bit = bitMatch ? (bitMatch[1] ?? bitMatch[2] ?? bitMatch[3]) : null;
+  if (!bit) {
+    return null;
+  }
+
+  if (/\bodd\b|奇數/.test(text)) {
+    return { mode: "parity", parity: 1, bit, label: `odd number of ${bit}s` };
+  }
+  if (/\beven\b|偶數/.test(text)) {
+    return { mode: "parity", parity: 0, bit, label: `even number of ${bit}s` };
+  }
+
+  const modulo = text.match(/\b(?:divisible\s+by|multiple\s+of|mod(?:ulo)?)\s+(two|three|four|five|six|seven|eight|\d+)\b/);
+  if (modulo) {
+    const divisor = parseNumberWord(modulo[1]);
+    if (divisor >= 2 && divisor <= 8) {
+      return { mode: "modulo", divisor, remainder: 0, bit, label: `number of ${bit}s divisible by ${divisor}` };
+    }
+  }
+
+  const remainder = text.match(/\b(?:remainder|mod(?:ulo)?)\s+(zero|one|two|three|four|five|six|seven|\d+)\s+(?:when\s+)?(?:divided\s+by|mod(?:ulo)?)\s+(two|three|four|five|six|seven|eight|\d+)\b/);
+  if (remainder) {
+    const rem = parseNumberWord(remainder[1]);
+    const divisor = parseNumberWord(remainder[2]);
+    if (divisor >= 2 && divisor <= 8 && rem < divisor) {
+      return { mode: "modulo", divisor, remainder: rem, bit, label: `number of ${bit}s mod ${divisor} = ${rem}` };
+    }
+  }
+
+  const threshold = text.match(/\b(at\s+least|not\s+less\s+than|minimum\s+of|exactly|at\s+most|no\s+more\s+than)\s+(one|two|three|four|five|six|seven|eight|\d+)\s+([01])(?:'s|s)?\b/);
+  if (threshold) {
+    const count = parseNumberWord(threshold[2]);
+    if (count >= 1 && count <= 7) {
+      return {
+        mode: canonicalQuantifier(threshold[1]),
+        count,
+        bit: threshold[3],
+        label: `${canonicalQuantifier(threshold[1])} ${count} ${threshold[3]}s`,
+      };
+    }
+  }
+
+  return null;
+}
+
+function canonicalQuantifier(value) {
+  if (/at\s+least|not\s+less\s+than|minimum/.test(value)) {
+    return "at least";
+  }
+  if (/at\s+most|no\s+more\s+than/.test(value)) {
+    return "at most";
+  }
+  return "exactly";
+}
+
 function parseNumberWord(value) {
   const numberWords = {
+    zero: 0,
     one: 1,
     two: 2,
     three: 3,
@@ -576,7 +732,11 @@ function parseNumberWord(value) {
 }
 
 function buildSequenceMachine(specification) {
-  if (specification.segments) {
+  if (specification.type === "counting") {
+    return buildCountingMachine(specification);
+  }
+
+  if (specification.type === "quantified") {
     return buildQuantifiedSequenceMachine(specification);
   }
 
@@ -637,7 +797,7 @@ function buildSequenceMachine(specification) {
 }
 
 function buildQuantifiedSequenceMachine(specification) {
-  const nfa = compileSequenceSegments(specification.segments);
+  const nfa = compileSequenceAlternatives(specification.quantifiedAlternatives);
   const startSet = epsilonClosure(new Set([nfa.start]), nfa.epsilon);
   const dfaStates = [];
   const stateIndexByKey = new Map();
@@ -708,11 +868,98 @@ function buildQuantifiedSequenceMachine(specification) {
   };
 }
 
+function buildCountingMachine(specification) {
+  const rule = specification.countingRule;
+  const states = countingStates(rule);
+  const targetInputIndex = rule.bit === "1" ? 1 : 0;
+  const transitions = states.map((countState, stateIndex) => {
+    return ["0", "1"].map((_, inputIndex) => {
+      const nextStateIndex = inputIndex === targetInputIndex
+        ? nextCountingStateIndex(rule, stateIndex)
+        : stateIndex;
+      return {
+        nextStateIndex,
+        output: specification.model === "mealy" && countingStateAccepts(rule, nextStateIndex) ? "1" : "0",
+      };
+    });
+  });
+  const stateOutputs = states.map((_, index) => countingStateAccepts(rule, index) ? "1" : "0");
+
+  const requestedCount = specification.requestedStateCount ?? states.length;
+  if (requestedCount < states.length) {
+    throw new Error(`此計數規則至少需要 ${states.length} 個狀態，無法以 ${requestedCount} states 正確表示。`);
+  }
+  if (requestedCount > 8) {
+    throw new Error("目前最多支援 8 個狀態。");
+  }
+
+  while (states.length < requestedCount) {
+    states.push(`unused-${states.length}`);
+    transitions.push([
+      { nextStateIndex: 0, output: "X" },
+      { nextStateIndex: 0, output: "X" },
+    ]);
+    stateOutputs.push("X");
+  }
+
+  return {
+    states,
+    transitions,
+    stateOutputs,
+  };
+}
+
+function countingStates(rule) {
+  if (rule.mode === "parity") {
+    return ["even", "odd"];
+  }
+  if (rule.mode === "modulo") {
+    return Array.from({ length: rule.divisor }, (_, index) => `mod-${index}`);
+  }
+  return Array.from({ length: rule.count + 2 }, (_, index) => {
+    if (index <= rule.count) {
+      return `${index}`;
+    }
+    return `more-than-${rule.count}`;
+  });
+}
+
+function nextCountingStateIndex(rule, stateIndex) {
+  if (rule.mode === "parity") {
+    return stateIndex ^ 1;
+  }
+  if (rule.mode === "modulo") {
+    return (stateIndex + 1) % rule.divisor;
+  }
+  return Math.min(stateIndex + 1, rule.count + 1);
+}
+
+function countingStateAccepts(rule, stateIndex) {
+  if (rule.mode === "parity") {
+    return stateIndex === rule.parity;
+  }
+  if (rule.mode === "modulo") {
+    return stateIndex === rule.remainder;
+  }
+  if (rule.mode === "at least") {
+    return stateIndex >= rule.count;
+  }
+  if (rule.mode === "at most") {
+    return stateIndex <= rule.count;
+  }
+  return stateIndex === rule.count;
+}
+
 function compileSequenceSegments(segments) {
+  return compileSequenceAlternatives([segments]);
+}
+
+function compileSequenceAlternatives(alternatives) {
   const transitions = new Map();
   const epsilon = new Map();
-  let current = 0;
-  let nextState = 1;
+  const start = 0;
+  const accept = 1;
+  let nextState = 2;
 
   const addTransition = (from, input, to) => {
     const key = `${from}-${input}`;
@@ -724,34 +971,38 @@ function compileSequenceSegments(segments) {
     epsilon.get(from).add(to);
   };
 
-  segments.forEach((segment) => {
-    for (let count = 0; count < segment.min; count += 1) {
-      const target = nextState;
-      nextState += 1;
-      addTransition(current, segment.bit, target);
-      current = target;
-    }
-
-    if (segment.max === Infinity) {
-      addTransition(current, segment.bit, current);
-      const target = nextState;
-      nextState += 1;
-      addEpsilon(current, target);
-      current = target;
-    } else {
-      for (let count = segment.min; count < segment.max; count += 1) {
+  alternatives.forEach((segments) => {
+    let current = start;
+    segments.forEach((segment) => {
+      for (let count = 0; count < segment.min; count += 1) {
         const target = nextState;
         nextState += 1;
-        addEpsilon(current, target);
         addTransition(current, segment.bit, target);
         current = target;
       }
-    }
+
+      if (segment.max === Infinity) {
+        addTransition(current, segment.bit, current);
+        const target = nextState;
+        nextState += 1;
+        addEpsilon(current, target);
+        current = target;
+      } else {
+        for (let count = segment.min; count < segment.max; count += 1) {
+          const target = nextState;
+          nextState += 1;
+          addEpsilon(current, target);
+          addTransition(current, segment.bit, target);
+          current = target;
+        }
+      }
+    });
+    addEpsilon(current, accept);
   });
 
   return {
-    start: 0,
-    accept: current,
+    start,
+    accept,
     transitions,
     epsilon,
   };
